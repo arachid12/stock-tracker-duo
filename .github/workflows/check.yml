@@ -1,0 +1,26 @@
+name: iPhone Duo stock check
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: state.json
+          key: duo-state-${{ github.run_id }}
+          restore-keys: duo-state-
+      - run: python iphone_duo_tracker.py
+        env:
+          ZIP: ${{ secrets.ZIP }}
+          PARTS: ${{ secrets.PARTS }}
+          MAX_STORES: "5"
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TWILIO_SID: ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM: ${{ secrets.TWILIO_FROM }}
+          TWILIO_TO: ${{ secrets.TWILIO_TO }}
