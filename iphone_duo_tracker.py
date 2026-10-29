@@ -25,6 +25,8 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -58,13 +60,22 @@ def discover_parts(zip_code):
     candidates = sorted(set(PART_RE.findall(html)))
     if not candidates:
         sys.exit("Couldn't find part numbers on Apple's page. Set PARTS manually (see README).")
-    stores = fetch_availability(zip_code, candidates)
     found = {}
-    for store in stores:
-        for part, info in store.get("partsAvailability", {}).items():
+    rejected = 0
+    for part in candidates:
+        try:
+            stores = fetch_availability(zip_code, [part])
+        except urllib.error.HTTPError:
+            rejected += 1          # Apple rejects codes that aren't real products
+            continue
+        finally:
+            time.sleep(0.3)
+        for store in stores[:1]:
+            info = store.get("partsAvailability", {}).get(part, {})
             title = info.get("messageTypes", {}).get("regular", {}).get("storePickupProductTitle", "")
             if WANTED.search(title):
                 found[part] = title
+    print(f"Tried {len(candidates)} codes from Apple's page; {rejected} rejected; {len(found)} matched.")
     if not found:
         sys.exit("Found part numbers but none matched iPhone Duo 256GB/512GB/1TB. Set PARTS manually.")
     return found
@@ -113,6 +124,17 @@ def notify(message):
     print("ALERT:", message)
 
 
+def load_state():
+    """State = discovered part numbers + store/model pairs already alerted on."""
+    try:
+        data = json.load(open(STATE_FILE))
+    except (FileNotFoundError, ValueError):
+        data = {}
+    if not isinstance(data, dict):      # older format was a bare list
+        data = {"seen": data}
+    return {"parts": data.get("parts", {}), "seen": data.get("seen", [])}
+
+
 def main():
     zip_code = os.environ.get("ZIP")
     parts = [p.strip() for p in os.environ.get("PARTS", "").split(",") if p.strip()]
@@ -120,8 +142,12 @@ def main():
         sys.exit("Set the ZIP environment variable. See README.md.")
     max_stores = int(os.environ.get("MAX_STORES", "5"))
 
+    state = load_state()
     if not parts:
-        found = discover_parts(zip_code)
+        found = state["parts"] if state["parts"] and "--list-parts" not in sys.argv else None
+        if not found:
+            found = discover_parts(zip_code)
+            state["parts"] = found
         parts = sorted(found)
         if "--list-parts" in sys.argv or "--test" in sys.argv:
             for p in parts:
@@ -139,10 +165,7 @@ def main():
         notify("Test alert from your iPhone Duo tracker.")
         return
 
-    try:
-        previous = set(json.load(open(STATE_FILE)))
-    except (FileNotFoundError, ValueError):
-        previous = set()
+    previous = set(state["seen"])
 
     new = {k: v for k, v in hits.items() if k not in previous}
     if new:
@@ -151,7 +174,8 @@ def main():
     else:
         print(f"Checked {len(stores[:max_stores])} stores; nothing new.")
 
-    json.dump(sorted(hits), open(STATE_FILE, "w"))
+    state["seen"] = sorted(hits)
+    json.dump(state, open(STATE_FILE, "w"))
 
 
 if __name__ == "__main__":
