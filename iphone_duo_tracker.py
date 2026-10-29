@@ -2,14 +2,15 @@
 """iPhone Duo Apple Store pickup tracker.
 
 Checks Apple's pickup availability for your ZIP and alerts you the moment a
-nearby store flips to "available". Standard library only.
+nearby store shows an iPhone Duo as available. Standard library only.
+
+Watches the six US models: 256GB, 512GB and 1TB in Night Sky and Star White.
 
 Config (environment variables):
   ZIP            Your ZIP code (required)
-  PARTS          Optional. Comma-separated Apple part numbers. Leave it unset and the
-                 script finds every iPhone Duo in 256GB, 512GB and 1TB (both colors)
-                 on its own from Apple's product page.
   MAX_STORES     How many of the nearest stores to watch (default 5)
+  PARTS          Optional. Comma-separated part numbers to watch instead of the
+                 six built-in ones.
 
   Alerts - set at least one:
   NTFY_TOPIC     Free push notifications via the ntfy app (instant setup)
@@ -17,13 +18,11 @@ Config (environment variables):
 
 Usage:
   python iphone_duo_tracker.py          # one check (what the scheduler runs)
-  python iphone_duo_tracker.py --test   # print what Apple returns + send a test alert
-  python iphone_duo_tracker.py --list-parts   # show which models it will watch
+  python iphone_duo_tracker.py --test   # show each store's status + send a test alert
 """
 import base64
 import json
 import os
-import re
 import sys
 import time
 import urllib.error
@@ -34,62 +33,37 @@ STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Version/17.0 Safari/605.1.15")
 
+# US part numbers, read from apple.com/shop/buy-iphone/iphone-duo (2TB left out on purpose).
+DEFAULT_PARTS = {
+    "MK1F4LL/A": "iPhone Duo 256GB Night Sky",
+    "MK1E4LL/A": "iPhone Duo 256GB Star White",
+    "MK1H4LL/A": "iPhone Duo 512GB Night Sky",
+    "MK1G4LL/A": "iPhone Duo 512GB Star White",
+    "MK1L4LL/A": "iPhone Duo 1TB Night Sky",
+    "MK1J4LL/A": "iPhone Duo 1TB Star White",
+}
 
-def fetch_availability(zip_code, parts):
-    params = [("pl", "true"), ("mts.0", "regular"), ("mts.1", "compact"),
-              ("location", zip_code)]
-    params += [(f"parts.{i}", p) for i, p in enumerate(parts)]
-    url = "https://www.apple.com/shop/fulfillment-messages?" + urllib.parse.urlencode(params)
+
+def fetch_stores(zip_code, part):
+    """Nearest stores (closest first) with their availability for one part number."""
+    params = [("mts.0", "regular"), ("mts.1", "compact"), ("cppart", "UNLOCKED/US"),
+              ("product", part), ("little", "false"), ("location", zip_code)]
+    url = ("https://www.apple.com/shop/pickup-message-recommendations?"
+           + urllib.parse.urlencode(params, safe="/"))
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=20) as r:
         data = json.load(r)
-    stores = data["body"]["content"]["pickupMessage"].get("stores", [])
-    return stores
+    return data["body"]["PickupMessage"].get("stores", [])
 
 
-WANTED = re.compile(r"iPhone Duo.*\b(256GB|512GB|1TB)\b", re.I)
-PART_RE = re.compile(r"\bM[A-Z0-9]{4}LL/A\b")
-
-
-def discover_parts(zip_code):
-    """Find iPhone Duo 256GB/512GB/1TB part numbers (any color) automatically."""
-    req = urllib.request.Request("https://www.apple.com/shop/buy-iphone/iphone-duo",
-                                 headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        html = r.read().decode("utf-8", "ignore")
-    candidates = sorted(set(PART_RE.findall(html)))
-    if not candidates:
-        sys.exit("Couldn't find part numbers on Apple's page. Set PARTS manually (see README).")
-    found = {}
-    rejected = 0
-    for part in candidates:
-        try:
-            stores = fetch_availability(zip_code, [part])
-        except urllib.error.HTTPError:
-            rejected += 1          # Apple rejects codes that aren't real products
-            continue
-        finally:
-            time.sleep(0.3)
-        for store in stores[:1]:
-            info = store.get("partsAvailability", {}).get(part, {})
-            title = info.get("messageTypes", {}).get("regular", {}).get("storePickupProductTitle", "")
-            if WANTED.search(title):
-                found[part] = title
-    print(f"Tried {len(candidates)} codes from Apple's page; {rejected} rejected; {len(found)} matched.")
-    if not found:
-        sys.exit("Found part numbers but none matched iPhone Duo 256GB/512GB/1TB. Set PARTS manually.")
-    return found
-
-
-def find_available(stores, parts, max_stores):
+def check_part(zip_code, part, max_stores):
+    """Return {store name: description} for stores where this part is available."""
     hits = {}
-    for store in stores[:max_stores]:
-        for part in parts:
-            info = store.get("partsAvailability", {}).get(part, {})
-            if info.get("pickupDisplay") == "available":
-                key = f"{store['storeName']}|{part}"
-                label = info.get("messageTypes", {}).get("regular", {}).get("storePickupProductTitle", part)
-                hits[key] = f"{label} at {store['storeName']} ({store.get('city', '')}, {store.get('state', '')})"
+    for store in fetch_stores(zip_code, part)[:max_stores]:
+        info = store.get("partsAvailability", {}).get(part, {})
+        if info.get("pickupDisplay") == "available":
+            hits[f"{store['storeName']}|{part}"] = (store["storeName"], store.get("city", ""),
+                                                    store.get("state", ""))
     return hits
 
 
@@ -124,58 +98,56 @@ def notify(message):
     print("ALERT:", message)
 
 
-def load_state():
-    """State = discovered part numbers + store/model pairs already alerted on."""
+def load_seen():
     try:
         data = json.load(open(STATE_FILE))
     except (FileNotFoundError, ValueError):
-        data = {}
-    if not isinstance(data, dict):      # older format was a bare list
-        data = {"seen": data}
-    return {"parts": data.get("parts", {}), "seen": data.get("seen", [])}
+        return set()
+    if isinstance(data, dict):
+        data = data.get("seen", [])
+    return set(data)
 
 
 def main():
     zip_code = os.environ.get("ZIP")
-    parts = [p.strip() for p in os.environ.get("PARTS", "").split(",") if p.strip()]
     if not zip_code:
         sys.exit("Set the ZIP environment variable. See README.md.")
     max_stores = int(os.environ.get("MAX_STORES", "5"))
+    custom = [p.strip() for p in os.environ.get("PARTS", "").split(",") if p.strip()]
+    parts = {p: DEFAULT_PARTS.get(p, p) for p in custom} if custom else dict(DEFAULT_PARTS)
 
-    state = load_state()
-    if not parts:
-        found = state["parts"] if state["parts"] and "--list-parts" not in sys.argv else None
-        if not found:
-            found = discover_parts(zip_code)
-            state["parts"] = found
-        parts = sorted(found)
-        if "--list-parts" in sys.argv or "--test" in sys.argv:
-            for p in parts:
-                print(p, "-", found[p])
-        if "--list-parts" in sys.argv:
-            return
+    hits, failures = {}, 0
+    for part, title in parts.items():
+        try:
+            found = check_part(zip_code, part, max_stores)
+        except (urllib.error.URLError, ValueError, KeyError) as e:
+            failures += 1
+            print(f"Check failed for {title} ({part}): {e}")
+            continue
+        finally:
+            time.sleep(0.5)
+        print(f"{title}: " + (", ".join(v[0] for v in found.values()) if found else "not available"))
+        for key, (store, city, st) in found.items():
+            hits[key] = f"{title} at {store} ({city}, {st})"
 
-    stores = fetch_availability(zip_code, parts)
-    hits = find_available(stores, parts, max_stores)
+    if failures == len(parts):
+        sys.exit("Every check failed - Apple may be blocking this server or changed its site.")
 
     if "--test" in sys.argv:
-        for s in stores[:max_stores]:
-            print(s["storeName"], {p: s.get("partsAvailability", {}).get(p, {}).get("pickupDisplay")
-                                   for p in parts})
         notify("Test alert from your iPhone Duo tracker.")
         return
 
-    previous = set(state["seen"])
-
+    previous = load_seen()
     new = {k: v for k, v in hits.items() if k not in previous}
     if new:
         notify("iPhone Duo available for pickup: " + "; ".join(new.values())
-               + " - https://www.apple.com/shop/buy-iphone")
+               + " - https://www.apple.com/shop/buy-iphone/iphone-duo")
     else:
-        print(f"Checked {len(stores[:max_stores])} stores; nothing new.")
+        print(f"Checked {len(parts)} models near {zip_code}; nothing new.")
 
-    state["seen"] = sorted(hits)
-    json.dump(state, open(STATE_FILE, "w"))
+    # Only forget a store/model once a check ran cleanly, so a failed check never re-alerts.
+    keep = set(hits) | (previous if failures else set())
+    json.dump({"seen": sorted(keep)}, open(STATE_FILE, "w"))
 
 
 if __name__ == "__main__":
